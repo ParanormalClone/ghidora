@@ -74,6 +74,6 @@ ollama_models/
 *.md
 !README.md
 
-# Static files (optional - comment out if needed)
-static/
-templates/
+# Static files (keep templates and static in git)
+# static/
+# templates/

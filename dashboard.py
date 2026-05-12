@@ -12,6 +12,11 @@ import json
 from pathlib import Path
 import subprocess
 import shutil
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 app = Flask(__name__)
 
@@ -54,9 +59,20 @@ EDITABLE_EXTENSIONS = ['.py', '.js', '.html', '.css', '.md']
 EDITED_FILES_LOG = []
 
 # Git integration configuration
-GIT_ENABLED = False
-GIT_REPO_PATH = os.getcwd()
+GIT_ENABLED = os.getenv('GIT_ENABLED', 'false').lower() == 'true'
+GIT_REPO_PATH = os.getenv('GIT_REPO_PATH', os.getcwd())
 AUTOMATION_COMMITS = []
+
+# Conversation persistence
+CONVERSATIONS_FILE = Path(os.getenv('CONVERSATIONS_FILE', 'conversations.json'))
+
+# Pipeline configurations
+PIPELINES = {
+    'feature': ['analysis', 'code_generation', 'creative_writing'],
+    'debug': ['analysis', 'debugging', 'analysis'],
+    'review': ['analysis', 'code_generation', 'creative_writing'],
+    'research': ['research', 'analysis', 'creative_writing']
+}
 
 # Head-to-head-to-head communication
 HEAD_SEQUENCE = [
@@ -65,9 +81,182 @@ HEAD_SEQUENCE = [
     ('gemma2:2b', 'GEMMA2', '#ffff00', 'Creative Head')
 ]
 
+# Scheduler configuration
+SCHEDULER_ENABLED = os.getenv('SCHEDULER_ENABLED', 'false').lower() == 'true'
+scheduler = BackgroundScheduler()
+SCHEDULED_JOBS = {}
+
+# File watcher configuration
+FILE_WATCHER_ENABLED = os.getenv('FILE_WATCHER_ENABLED', 'false').lower() == 'true'
+WATCH_DIRECTORY = os.getenv('WATCH_DIRECTORY', os.getcwd())
+file_observer = None
+
+class CodeFileHandler(FileSystemEventHandler):
+    """Handle file system events for code files"""
+    def __init__(self):
+        self.last_modified = {}
+    
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        
+        file_path = event.src_path
+        ext = Path(file_path).suffix
+        
+        if ext not in EDITABLE_EXTENSIONS:
+            return
+        
+        # Debounce - ignore if modified within last 2 seconds
+        now = datetime.now()
+        if file_path in self.last_modified:
+            if (now - self.last_modified[file_path]).total_seconds() < 2:
+                return
+        
+        self.last_modified[file_path] = now
+        print(f"📁 File modified: {file_path}")
+        
+        # Log the change
+        EDITED_FILES_LOG.append({
+            'timestamp': now.isoformat(),
+            'file_path': file_path,
+            'event': 'modified',
+            'auto_detected': True
+        })
+        
+        # Auto-commit if git is enabled
+        if GIT_ENABLED:
+            try:
+                run_git_command(f'git add {file_path}', 'Auto-stage file')
+                commit_msg = f"Auto-commit: Modified {Path(file_path).name}"
+                run_git_command(f'git commit -m "{commit_msg}"', 'Auto-commit')
+                AUTOMATION_COMMITS.append({
+                    'timestamp': now.isoformat(),
+                    'file': file_path,
+                    'message': commit_msg
+                })
+                print(f"✅ Auto-committed: {commit_msg}")
+            except Exception as e:
+                print(f"❌ Auto-commit failed: {e}")
+
+def start_file_watcher():
+    """Start the file system watcher"""
+    global file_observer
+    if not FILE_WATCHER_ENABLED:
+        return
+    
+    file_observer = Observer()
+    handler = CodeFileHandler()
+    file_observer.schedule(handler, WATCH_DIRECTORY, recursive=True)
+    file_observer.start()
+    print(f"👁️ File watcher started on: {WATCH_DIRECTORY}")
+
+def stop_file_watcher():
+    """Stop the file system watcher"""
+    global file_observer
+    if file_observer:
+        file_observer.stop()
+        file_observer.join()
+        print("👁️ File watcher stopped")
+
+def scheduled_health_check():
+    """Scheduled job: Check health of all models"""
+    print("⏰ Running scheduled health check...")
+    models = ['llama3.2:3b', 'qwen2.5-coder:1.5b', 'gemma2:2b']
+    for model in models:
+        result = check_model_health(model)
+        status = "✅" if result['status'] == 'healthy' else "❌"
+        print(f"   {status} {model}: {result['status']}")
+
+def scheduled_conversation_cleanup():
+    """Scheduled job: Clean up old conversations"""
+    print("⏰ Running conversation cleanup...")
+    # Keep only last 100 conversations
+    global conversations
+    if len(conversations) > 100:
+        sorted_convos = sorted(conversations.items(), key=lambda x: x[0])
+        conversations = dict(sorted_convos[-100:])
+        save_conversations()
+        print(f"   Cleaned up, kept {len(conversations)} conversations")
+
+def setup_scheduler():
+    """Set up scheduled jobs"""
+    if not SCHEDULER_ENABLED:
+        return
+    
+    # Health check every 5 minutes
+    scheduler.add_job(
+        scheduled_health_check,
+        IntervalTrigger(minutes=5),
+        id='health_check',
+        name='Health Check',
+        replace_existing=True
+    )
+    SCHEDULED_JOBS['health_check'] = {'interval': '5 minutes', 'description': 'Check model health'}
+    
+    # Conversation cleanup at midnight
+    scheduler.add_job(
+        scheduled_conversation_cleanup,
+        CronTrigger(hour=0, minute=0),
+        id='conversation_cleanup',
+        name='Conversation Cleanup',
+        replace_existing=True
+    )
+    SCHEDULED_JOBS['conversation_cleanup'] = {'schedule': 'midnight', 'description': 'Clean old conversations'}
+    
+    scheduler.start()
+    print("⏰ Scheduler started with jobs:", list(SCHEDULED_JOBS.keys()))
+
+def load_conversations():
+    """Load conversations from JSON file"""
+    global conversations
+    if CONVERSATIONS_FILE.exists():
+        try:
+            with open(CONVERSATIONS_FILE, 'r') as f:
+                conversations = json.load(f)
+        except Exception as e:
+            print(f"Error loading conversations: {e}")
+            conversations = {}
+
+def save_conversations():
+    """Save conversations to JSON file"""
+    try:
+        with open(CONVERSATIONS_FILE, 'w') as f:
+            json.dump(conversations, f, indent=2, default=str)
+    except Exception as e:
+        print(f"Error saving conversations: {e}")
+
+def check_model_health(model):
+    """Check if a model is responsive"""
+    try:
+        res = ollama.chat(model=model, messages=[{'role': 'user', 'content': 'ping'}])
+        return {'status': 'healthy', 'model': model}
+    except Exception as e:
+        return {'status': 'unhealthy', 'model': model, 'error': str(e)}
+
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for all models"""
+    models = ['llama3.2:3b', 'qwen2.5-coder:1.5b', 'gemma2:2b']
+    results = {}
+    all_healthy = True
+    
+    for model in models:
+        result = check_model_health(model)
+        results[model] = result
+        if result['status'] != 'healthy':
+            all_healthy = False
+    
+    return jsonify({
+        'status': 'healthy' if all_healthy else 'degraded',
+        'models': results,
+        'git_enabled': GIT_ENABLED,
+        'conversations_count': len(conversations),
+        'timestamp': datetime.now().isoformat()
+    }), 200 if all_healthy else 503
 
 @app.route('/static/<path:filename>')
 def static_files(filename):
@@ -136,6 +325,7 @@ def chat():
             end_time = datetime.now()
             processing_time = (end_time - start_time).total_seconds()
 
+            save_conversations()
             return jsonify({
                 'all_responses': responses,
                 'role': role,
@@ -168,6 +358,7 @@ def chat():
 
             print(f"{model} finished.")
 
+            save_conversations()
             return jsonify({
                 'response': output,
                 'model': model,
@@ -337,6 +528,147 @@ def get_history(conversation_id):
         'history': conversations[conversation_id]
     })
 
+@app.route('/pipeline/<pipeline_type>', methods=['POST'])
+def run_pipeline(pipeline_type):
+    """Run a multi-head pipeline (feature, debug, review, research)"""
+    print(f"--- Received Pipeline Request: {pipeline_type} ---")
+    
+    if pipeline_type not in PIPELINES:
+        return jsonify({'error': f'Unknown pipeline: {pipeline_type}. Available: {list(PIPELINES.keys())}'}), 400
+    
+    data = request.get_json()
+    user_prompt = data.get('prompt', '')
+    conversation_id = data.get('conversation_id')
+    start_time = datetime.now()
+    
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+        conversations[conversation_id] = []
+    
+    pipeline_steps = PIPELINES[pipeline_type]
+    pipeline_results = []
+    current_context = user_prompt
+    
+    try:
+        for i, role in enumerate(pipeline_steps):
+            model = ROLE_LLM_MAPPING.get(role, 'llama3.2:3b')
+            step_name = f"Step {i+1}: {role.replace('_', ' ').title()}"
+            print(f"  {step_name} using {model}...")
+            
+            # Build prompt with context from previous steps
+            if i == 0:
+                step_prompt = current_context
+            else:
+                prev_response = pipeline_results[-1]['response']
+                step_prompt = f"""Previous step output:
+{prev_response}
+
+Original request: {user_prompt}
+
+Now, as the {role.replace('_', ' ')} specialist, please continue the work."""
+            
+            messages = [{'role': 'user', 'content': step_prompt}]
+            res = ollama.chat(model=model, messages=messages)
+            response = res['message']['content']
+            
+            pipeline_results.append({
+                'step': i + 1,
+                'role': role,
+                'model': model,
+                'display_name': MODEL_DISPLAY_NAMES.get(model, model),
+                'color': MODEL_COLORS.get(model, '#00ffff'),
+                'response': response
+            })
+            
+            # Store in conversation
+            conversations[conversation_id].extend([
+                {'role': 'user', 'content': f"[PIPELINE:{pipeline_type}:{step_name}] {step_prompt[:200]}..."},
+                {'role': 'assistant', 'content': response, 'model': model}
+            ])
+        
+        end_time = datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        save_conversations()
+        return jsonify({
+            'pipeline_type': pipeline_type,
+            'steps': pipeline_results,
+            'final_output': pipeline_results[-1]['response'] if pipeline_results else '',
+            'conversation_id': conversation_id,
+            'timestamp': end_time.isoformat(),
+            'processing_time': processing_time,
+            'mode': 'pipeline'
+        })
+        
+    except Exception as e:
+        print(f"ERROR in pipeline: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/pipelines', methods=['GET'])
+def list_pipelines():
+    """List available pipelines"""
+    return jsonify({
+        'pipelines': [
+            {'id': 'feature', 'name': 'Feature Development', 'steps': PIPELINES['feature'], 'description': 'Analyze → Code → Document'},
+            {'id': 'debug', 'name': 'Debug Workflow', 'steps': PIPELINES['debug'], 'description': 'Analyze → Debug → Verify'},
+            {'id': 'review', 'name': 'Code Review', 'steps': PIPELINES['review'], 'description': 'Analyze → Suggest → Implement'},
+            {'id': 'research', 'name': 'Research', 'steps': PIPELINES['research'], 'description': 'Research → Analyze → Summarize'}
+        ]
+    })
+
+@app.route('/jobs', methods=['GET'])
+def list_jobs():
+    """List scheduled jobs"""
+    jobs_info = []
+    for job_id, info in SCHEDULED_JOBS.items():
+        job = scheduler.get_job(job_id)
+        jobs_info.append({
+            'id': job_id,
+            'info': info,
+            'next_run': str(job.next_run_time) if job else None,
+            'active': job is not None
+        })
+    
+    return jsonify({
+        'scheduler_enabled': SCHEDULER_ENABLED,
+        'jobs': jobs_info
+    })
+
+@app.route('/jobs/<job_id>/trigger', methods=['POST'])
+def trigger_job(job_id):
+    """Manually trigger a scheduled job"""
+    if job_id == 'health_check':
+        scheduled_health_check()
+        return jsonify({'success': True, 'message': 'Health check triggered'})
+    elif job_id == 'conversation_cleanup':
+        scheduled_conversation_cleanup()
+        return jsonify({'success': True, 'message': 'Conversation cleanup triggered'})
+    else:
+        return jsonify({'error': f'Unknown job: {job_id}'}), 404
+
+@app.route('/watcher/status', methods=['GET'])
+def watcher_status():
+    """Get file watcher status"""
+    return jsonify({
+        'enabled': FILE_WATCHER_ENABLED,
+        'watch_directory': WATCH_DIRECTORY,
+        'running': file_observer is not None and file_observer.is_alive() if file_observer else False,
+        'recent_changes': EDITED_FILES_LOG[-10:]
+    })
+
+@app.route('/watcher/toggle', methods=['POST'])
+def toggle_watcher():
+    """Toggle file watcher on/off"""
+    global FILE_WATCHER_ENABLED
+    
+    if file_observer and file_observer.is_alive():
+        stop_file_watcher()
+        return jsonify({'enabled': False, 'message': 'File watcher stopped'})
+    else:
+        FILE_WATCHER_ENABLED = True
+        start_file_watcher()
+        return jsonify({'enabled': True, 'message': f'File watcher started on {WATCH_DIRECTORY}'})
+
 @app.route('/automation', methods=['POST'])
 def automation_endpoint():
     """Dedicated automation workflow endpoint"""
@@ -502,10 +834,8 @@ If modifying existing code, provide the complete updated code.
 
 Make sure the code is syntactically correct and follows best practices."""
         
-        # Get implementation from Code Head
-        loop = asyncio.get_event_loop()
-        res = loop.run_in_executor(None, 
-            lambda: ollama.chat(model='qwen2.5-coder:1.5b', messages=[{'role': 'user', 'content': implementation_prompt}]))
+        # Get implementation from Code Head (synchronous call)
+        res = ollama.chat(model='qwen2.5-coder:1.5b', messages=[{'role': 'user', 'content': implementation_prompt}])
         
         implemented_code = res['message']['content'].strip()
         
@@ -718,13 +1048,35 @@ def run_discord_bot():
     bot.run(DISCORD_TOKEN)
 
 if __name__ == '__main__':
+    # Load saved conversations
+    load_conversations()
+    print(f"📂 Loaded {len(conversations)} conversations from {CONVERSATIONS_FILE}")
+    
+    # Start scheduler
+    setup_scheduler()
+    
+    # Start file watcher
+    start_file_watcher()
+    
     # Start Discord bot in background thread
     if DISCORD_TOKEN != 'YOUR_BOT_TOKEN_HERE':
         discord_thread = threading.Thread(target=run_discord_bot, daemon=True)
         discord_thread.start()
-        print("Discord bot started in background thread")
+        print("🤖 Discord bot started in background thread")
     else:
         print("⚠️  Discord token not configured. Set DISCORD_TOKEN environment variable to enable Discord bot.")
 
-    # Threaded=False can sometimes help debug local GPU collisions
-    app.run(port=5000, debug=True)
+    print("🐉 Ghidorah Dashboard starting...")
+    print(f"   Git Integration: {'Enabled' if GIT_ENABLED else 'Disabled'}")
+    print(f"   Scheduler: {'Enabled' if SCHEDULER_ENABLED else 'Disabled'}")
+    print(f"   File Watcher: {'Enabled' if FILE_WATCHER_ENABLED else 'Disabled'}")
+    print(f"   Available Pipelines: {list(PIPELINES.keys())}")
+    
+    try:
+        # Threaded=False can sometimes help debug local GPU collisions
+        app.run(port=5000, debug=True)
+    finally:
+        # Cleanup on shutdown
+        stop_file_watcher()
+        if SCHEDULER_ENABLED:
+            scheduler.shutdown()
