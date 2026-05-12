@@ -1,0 +1,4 @@
+flask==2.3.3
+discord.py==2.3.2
+ollama==0.1.7
+python-dotenv==1.0.0
