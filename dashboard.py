@@ -53,6 +53,11 @@ CODE_EDITING_ENABLED = True
 EDITABLE_EXTENSIONS = ['.py', '.js', '.html', '.css', '.md']
 EDITED_FILES_LOG = []
 
+# Git integration configuration
+GIT_ENABLED = False
+GIT_REPO_PATH = os.getcwd()
+AUTOMATION_COMMITS = []
+
 # Head-to-head-to-head communication
 HEAD_SEQUENCE = [
     ('llama3.2:3b', 'LLAMA 3.2', '#00ffff', 'Analysis Head'),
@@ -530,6 +535,54 @@ Make sure the code is syntactically correct and follows best practices."""
         return None, f"❌ Error implementing feature: {str(e)}"
 
 
+def run_git_command(command, description):
+    """Run a git command and return the output"""
+    try:
+        result = subprocess.run(
+            command.split(),
+            cwd=GIT_REPO_PATH,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+async def automation_workflow(user_prompt, conversation_id):
+    """Run automation workflow with all three heads"""
+    try:
+        workflow_results = []
+        
+        for model, display_name, color, head_name in HEAD_SEQUENCE:
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(
+                None, 
+                lambda m=model: ollama.chat(model=m, messages=[{'role': 'user', 'content': user_prompt}])
+            )
+            workflow_results.append({
+                'response': res['message']['content'],
+                'model': model,
+                'display_name': display_name,
+                'color': color,
+                'head_name': head_name
+            })
+        
+        return {
+            'automation_complete': True,
+            'workflow_results': workflow_results,
+            'original_prompt': user_prompt
+        }
+    except Exception as e:
+        return {'automation_complete': False, 'error': str(e)}
+
+
+async def head_to_head_response(user_prompt, conversation_id):
+    """Get responses from all three heads in sequence with context passing"""
+    responses = []
+    current_context = user_prompt
+    
     for i, (model, display_name, color, head_name) in enumerate(HEAD_SEQUENCE):
         # Build messages with previous head's response
         messages = [{'role': 'user', 'content': current_context}]
@@ -557,6 +610,30 @@ Make sure the code is syntactically correct and follows best practices."""
             'color': color,
             'head_name': head_name
         })
+    
+    # Create final synthesized response
+    final_prompt = f"""Based on the following responses from three AI heads, synthesize a final comprehensive answer:
+
+Original question: {user_prompt}
+
+"""
+    for resp in responses:
+        final_prompt += f"{resp['head_name']}: {resp['response']}\n\n"
+    
+    final_prompt += "Please provide a synthesized final response combining the best insights from all three heads."
+    
+    loop = asyncio.get_event_loop()
+    final_res = await loop.run_in_executor(
+        None, 
+        lambda: ollama.chat(model='llama3.2:3b', messages=[{'role': 'user', 'content': final_prompt}])
+    )
+    
+    return {
+        'head_responses': responses,
+        'final_response': final_res['message']['content'],
+        'original_prompt': user_prompt
+    }
+
 
 @bot.event
 async def on_ready():
@@ -615,6 +692,9 @@ async def single_head(ctx, head_name: str, *, prompt: str):
         await ctx.send(response)
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
+
+
+@bot.command(name='implement')
 async def manual_implement(ctx, *, suggestion: str):
     """Manually implement a feature suggestion"""
     await ctx.send(f"🔧 **Code Head implementing feature...**\nSuggestion: {suggestion}")
